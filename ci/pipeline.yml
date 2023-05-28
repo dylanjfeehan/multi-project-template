@@ -1,0 +1,368 @@
+resource_types:
+  - name: http-api
+    type: docker-image
+    source:
+      repository: aequitas/http-api-resource
+      tag: latest
+
+  - name: nexus-resource
+    type: docker-image
+    source:
+      repository: nexus.tools.dcsg.com:5003/dsg/nexus-resource
+      tag: latest
+      username: ((conbot_user))
+      password: ((conbot_pwd))
+
+  - name: cf-cli-resource
+    type: registry-image
+    source:
+      repository: nulldriver/cf-cli-resource
+      tag: latest
+
+resources:
+  - name: git
+    type: git
+    source:
+      uri: git@github.com:dsg-tech/pricing-postgres-product-info-sink.git
+      branch: main
+      private_key: ((pricing-postgres-product-info-sink-deploykey.private))
+
+  - name: jira-ticket
+    type: http-api
+    source:
+      uri: https://jirachangeapi.dcsg.com/api/jira/create/change/concourse
+      method: POST
+      json:
+        product_data:
+          product_name: ((app_name))
+        build_data:
+          build_name: "{BUILD_NAME}"
+          build_job_name: "{BUILD_JOB_NAME}"
+          build_pipeline_name: "{BUILD_PIPELINE_NAME}"
+          build_id: "{BUILD_ID}"
+        jira_data:
+          team: "Tech-PricingAndPromotions"
+
+  - name: cf-env-an01
+    type: cf-cli-resource
+    source:
+      api: ((public_cloud_api_np))
+      username: ((cf_user_nonprod))
+      password: ((cf_password_nonprod))
+      skip_cert_check: true
+      cf_cli_version: 7
+
+  - name: cf-env-prod-vp01
+    type: cf-cli-resource
+    source:
+      api: ((private_cloud_api_prod))
+      username: ((cf_user_prod))
+      password: ((cf_password_prod))
+      skip_cert_check: true
+      cf_cli_version: 7
+
+  - name: cf-env-prod-ap01
+    type: cf-cli-resource
+    source:
+      api: ((public_cloud_api_prod))
+      username: ((cf_user_prod))
+      password: ((cf_password_prod))
+      skip_cert_check: true
+      cf_cli_version: 7
+
+  - name: cf-env-prod-ap03
+    type: cf-cli-resource
+    source:
+      api: ((public3_cloud_api_prod))
+      username: ((cf_user_prod))
+      password: ((cf_password_prod))
+      skip_cert_check: true
+      cf_cli_version: 7
+
+jobs:
+  - name: build-and-deploy
+    plan:
+      - get: git
+        trigger: true
+      - task: build
+        file: git/ci/build.yml
+        privileged: true
+      - put: cf-env-an01
+        params:
+          command: push
+          org: pricing
+          space: dev
+          manifest: build-output/manifest.yml
+          path: build-output/webapp.jar
+          environment_variables:
+            CONFIG_SERVER_URL: https://pricing-config-server.apps.an01.pcf.dcsg.com
+          vars:
+            app_name: ((app_name))-inactive
+            memory: 1G
+            stack: cflinuxfs3
+            java_opts: '-Xmx512M'
+
+  - name: dev-swap
+    plan:
+      - get: git
+        passed:
+          - build-and-deploy
+        trigger: true
+      - task: dev-swap
+        file: git/ci/cf_swap.yml
+        params:
+          CF_USERNAME: ((cf_user_nonprod))
+          CF_PASSWORD: ((cf_password_nonprod))
+          CF_API_URL: ((public_cloud_api_np))
+          CF_SPACE: dev
+          CF_APP_NAME: ((app_name))
+          PCF_FOUNDATION_ID: ((public_cloud_pcf_id_np))
+          ENABLE_AUTOSCALE: false
+
+  - name: dev-healthcheck
+    plan:
+      - get: git
+        passed:
+          - dev-swap
+        trigger: true
+      - task: test
+        file: git/ci/curl_health_check.yml
+        params:
+          BASE_APP_URL: https://((app_name)).apps.((public_cloud_pcf_id_np)).pcf.dcsg.com
+
+  - name: deploy-qa
+    plan:
+      - get: git
+        passed:
+          - build-and-deploy
+          - dev-healthcheck
+        trigger: true
+      - task: build-qa
+        file: git/ci/build_prod.yml
+      - put: cf-env-an01
+        params:
+          command: push
+          org: pricing
+          space: qa
+          manifest: build-output/manifest.yml
+          path: build-output/webapp.jar
+          environment_variables:
+            CONFIG_SERVER_URL: https://pricing-config-server-qa.apps.an01.pcf.dcsg.com
+            SPRING_PROFILES_ACTIVE: qa
+          vars:
+            app_name: ((app_name))-qa-inactive
+            memory: 1G
+            stack: cflinuxfs3
+            java_opts: '-Xmx512M'
+
+  - name: qa-swap
+    plan:
+      - get: git
+        passed:
+          - deploy-qa
+        trigger: true
+      - task: qa-swap
+        file: git/ci/cf_swap.yml
+        params:
+          CF_USERNAME: ((cf_user_nonprod))
+          CF_PASSWORD: ((cf_password_nonprod))
+          CF_API_URL: ((public_cloud_api_np))
+          CF_SPACE: qa
+          CF_APP_NAME: ((app_name))-qa
+          PCF_FOUNDATION_ID: ((public_cloud_pcf_id_np))
+          ENABLE_AUTOSCALE: false
+
+  - name: qa-healthcheck
+    plan:
+      - get: git
+        passed:
+          - qa-swap
+        trigger: true
+      - task: test
+        file: git/ci/curl_health_check.yml
+        params:
+          BASE_APP_URL: https://((app_name))-qa.apps.((public_cloud_pcf_id_np)).pcf.dcsg.com
+
+  - name: deploy-to-prod-inactive
+    plan:
+      - get: git
+        passed:
+          - build-and-deploy
+          - qa-healthcheck
+      - task: build
+        file: git/ci/build_prod.yml
+      - in_parallel:
+          limit: 3
+          fail_fast: true
+          steps:
+            - put: cf-env-prod-vp01
+              params:
+                command: push
+                org: pricing
+                space: prod
+                manifest: build-output/manifest.yml
+                path: build-output/webapp.jar
+                environment_variables:
+                  CONFIG_SERVER_URL: https://pricing-config-server.apps.vp01.pcf.dcsg.com
+                vars:
+                  app_name: ((app_name))-inactive
+                  memory: 1G
+                  stack: cflinuxfs3
+                  java_opts: '-Xmx512M'
+              on_failure:
+                task: alert-private
+                file: git/ci/teams_alerts.yml
+                params:
+                  PIPELINE_NAME: ((app_name))
+                  JOB_NAME: prod deploy inactive cf push vp01
+            - put: cf-env-prod-ap01
+              params:
+                command: push
+                org: pricing
+                space: prod
+                manifest: build-output/manifest.yml
+                path: build-output/webapp.jar
+                environment_variables:
+                  CONFIG_SERVER_URL: https://pricing-config-server.apps.ap01.pcf.dcsg.com
+                vars:
+                  app_name: ((app_name))-inactive
+                  memory: 1G
+                  stack: cflinuxfs3
+                  java_opts: '-Xmx512M'
+              on_failure:
+                task: alert-public
+                file: git/ci/teams_alerts.yml
+                params:
+                  PIPELINE_NAME: ((app_name))
+                  JOB_NAME: prod deploy inactive cf push ap01
+            - put: cf-env-prod-ap03
+              params:
+                command: push
+                org: pricing
+                space: prod
+                manifest: build-output/manifest.yml
+                path: build-output/webapp.jar
+                environment_variables:
+                  CONFIG_SERVER_URL: https://pricing-config-server.apps.ap03.pcf.dcsg.com
+                vars:
+                  app_name: ((app_name))-inactive
+                  memory: 1G
+                  stack: cflinuxfs3
+                  java_opts: '-Xmx512M'
+              on_failure:
+                task: alert-public3
+                file: git/ci/teams_alerts.yml
+                params:
+                  PIPELINE_NAME: ((app_name))
+                  JOB_NAME: prod deploy inactive cf push ap03
+
+  - name: prod-swap-ap01
+    plan:
+      - get: git
+        passed:
+          - deploy-to-prod-inactive
+        trigger: true
+      - task: prod-swap
+        file: git/ci/cf_swap.yml
+        params:
+          CF_USERNAME: ((cf_user_prod))
+          CF_PASSWORD: ((cf_password_prod))
+          CF_API_URL: ((public_cloud_api_prod))
+          CF_SPACE: prod
+          CF_APP_NAME: ((app_name))
+          PCF_FOUNDATION_ID: ((public_cloud_pcf_id_prod))
+          ENABLE_AUTOSCALE: false
+        on_failure:
+          task: alert-public
+          file: git/ci/teams_alerts.yml
+          params:
+            PIPELINE_NAME: ((app_name))
+            JOB_NAME: prod swap ap01
+
+  - name: prod-swap-ap03
+    plan:
+      - get: git
+        passed:
+          - prod-swap-ap01
+        trigger: true
+      - task: prod-swap
+        file: git/ci/cf_swap.yml
+        params:
+          CF_USERNAME: ((cf_user_prod))
+          CF_PASSWORD: ((cf_password_prod))
+          CF_API_URL: ((public3_cloud_api_prod))
+          CF_SPACE: prod
+          CF_APP_NAME: ((app_name))
+          PCF_FOUNDATION_ID: ((public3_cloud_pcf_id_prod))
+          ENABLE_AUTOSCALE: false
+        on_failure:
+          task: alert-public3
+          file: git/ci/teams_alerts.yml
+          params:
+            PIPELINE_NAME: ((app_name))
+            JOB_NAME: prod swap ap03
+
+  - name: prod-swap-vp01
+    plan:
+      - get: git
+        passed:
+          - prod-swap-ap03
+        trigger: true
+      - task: prod-swap
+        file: git/ci/cf_swap.yml
+        params:
+          CF_USERNAME: ((cf_user_prod))
+          CF_PASSWORD: ((cf_password_prod))
+          CF_API_URL: ((private_cloud_api_prod))
+          CF_SPACE: prod
+          CF_APP_NAME: ((app_name))
+          PCF_FOUNDATION_ID: ((private_cloud_pcf_id_prod))
+          ENABLE_AUTOSCALE: false
+        on_failure:
+          task: alert-private
+          file: git/ci/teams_alerts.yml
+          params:
+            PIPELINE_NAME: ((app_name))
+            JOB_NAME: prod swap vp01
+
+  - name: prod-healthcheck-vp01
+    plan:
+      - get: git
+        passed:
+          - prod-swap-vp01
+        trigger: true
+      - task: test
+        file: git/ci/curl_health_check.yml
+        params:
+          BASE_APP_URL: https://((app_name)).apps.((private_cloud_pcf_id_prod)).pcf.dcsg.com
+
+  - name: prod-healthcheck-ap01
+    plan:
+      - get: git
+        passed:
+          - prod-swap-ap01
+        trigger: true
+      - task: test
+        file: git/ci/curl_health_check.yml
+        params:
+          BASE_APP_URL: https://((app_name)).apps.((public_cloud_pcf_id_prod)).pcf.dcsg.com
+
+  - name: prod-healthcheck-ap03
+    plan:
+      - get: git
+        passed:
+          - prod-swap-ap03
+        trigger: true
+      - task: test
+        file: git/ci/curl_health_check.yml
+        params:
+          BASE_APP_URL: https://((app_name)).apps.((public3_cloud_pcf_id_prod)).pcf.dcsg.com
+
+  - name: submit-jira-ticket
+    plan:
+      - get: git
+        trigger: true
+        passed:
+          - deploy-to-prod-inactive
+        on_success:
+          put: jira-ticket

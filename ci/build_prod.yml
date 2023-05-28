@@ -1,0 +1,17 @@
+---
+platform: linux
+
+image_resource:
+  type: docker-image
+  source:
+    repository: maven
+    tag: "3-openjdk-11"
+
+inputs:
+  - name: git
+
+outputs:
+  - name: build-output
+
+run:
+  path: git/ci/build_prod.sh

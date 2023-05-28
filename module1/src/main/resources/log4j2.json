@@ -1,0 +1,24 @@
+{
+  "configuration": {
+    "appenders": {
+      "Console": {
+        "name": "STDOUT",
+        "JSONLayout": {
+          "compact": "true",
+          "eventEol":"true",
+          "properties":"true",
+          "objectMessageAsJsonObject":"true",
+          "stackTraceAsString": "true"
+        }
+      }
+    },
+    "loggers": {
+      "root": {
+        "level": "info",
+        "AppenderRef": {
+          "ref": "STDOUT"
+        }
+      }
+    }
+  }
+}
